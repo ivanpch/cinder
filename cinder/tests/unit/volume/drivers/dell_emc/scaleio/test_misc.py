@@ -1,4 +1,4 @@
-# Copyright (c) 2013 - 2015 EMC Corporation.
+# Copyright (c) 2013 - 2020 Dell Inc. or its subsidiaries.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -12,6 +12,8 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
+import json
 
 import ddt
 import mock
@@ -114,52 +116,26 @@ class TestMisc(scaleio.TestScaleIODriver):
     def test_valid_configuration(self):
         self.driver.check_for_setup_error()
 
-    def test_both_storage_pool(self):
-        """Both storage name and ID provided.
-
-        INVALID
-        """
-        self.driver.configuration.sio_storage_pool_id = self.STORAGE_POOL_ID
-        self.driver.configuration.sio_storage_pool_name = (
-            self.STORAGE_POOL_NAME
-        )
-        self.assertRaises(exception.InvalidInput,
-                          self.driver.check_for_setup_error)
-
-    def test_no_storage_pool(self):
-        """No storage name or ID provided.
-
-        VALID as storage_pools are defined
-        """
-        self.driver.configuration.sio_storage_pool_name = None
-        self.driver.configuration.sio_storage_pool_id = None
-        self.driver.check_for_setup_error()
-
-    def test_both_domain(self):
-        """Both domain and ID are provided
-
-        INVALID
-        """
-        self.driver.configuration.sio_protection_domain_name = (
-            self.PROT_DOMAIN_NAME)
-        self.driver.configuration.sio_protection_domain_id = (
-            self.PROT_DOMAIN_ID)
-        self.assertRaises(exception.InvalidInput,
-                          self.driver.check_for_setup_error)
-
     def test_no_storage_pools(self):
         """No storage pools.
 
-        VALID as domain and storage pool names are provided
+        INVALID Storage pools must be set
         """
         self.driver.storage_pools = None
-        self.driver.check_for_setup_error()
+        self.assertRaises(exception.InvalidInput,
+                          self.driver.check_for_setup_error)
+
+    def test_invalid_storage_pools(self):
+        """Invalid storage pools data"""
+        self.driver.storage_pools = "test"
+        self.assertRaises(exception.InvalidInput,
+                          self.driver.check_for_setup_error)
 
     def test_volume_size_round_true(self):
         self.driver._check_volume_size(1)
 
     def test_volume_size_round_false(self):
-        self.override_config('sio_round_volume_capacity', False,
+        self.override_config('vxflexos_round_volume_capacity', False,
                              configuration.SHARED_CONF_GROUP)
         self.assertRaises(exception.VolumeBackendAPIException,
                           self.driver._check_volume_size, 1)
@@ -314,3 +290,42 @@ class TestMisc(scaleio.TestScaleIODriver):
         self.assertEqual(
             expected_provisioning_type,
             self.driver._find_provisioning_type(empty_storage_type))
+
+    def test_get_volume_stats_v3(self):
+        self.driver.server_api_version = "3.0"
+        zero_data = {
+            'types/StoragePool/instances/action/querySelectedStatistics':
+                mocks.MockHTTPSResponse(content=json.dumps(
+                    {'"{}"'.format(self.STORAGE_POOL_NAME): {
+                        'snapCapacityInUseInKb': 0,
+                        'thickCapacityInUseInKb': 0,
+                        'netCapacityInUseInKb': 0,
+                        'netUnusedCapacityInKb': 0,
+                        'thinCapacityAllocatedInKb': 0}
+                     }
+                ))
+        }
+        with self.custom_response_mode(**zero_data):
+            stats = self.driver.get_volume_stats(True)
+            for s in ["total_capacity_gb",
+                      "free_capacity_gb",
+                      "provisioned_capacity_gb"]:
+                self.assertEqual(0, stats[s])
+
+        data = {
+            'types/StoragePool/instances/action/querySelectedStatistics':
+                mocks.MockHTTPSResponse(content=json.dumps(
+                    {'"{}"'.format(self.STORAGE_POOL_NAME): {
+                        'snapCapacityInUseInKb': 2097152,
+                        'thickCapacityInUseInKb': 67108864,
+                        'netCapacityInUseInKb': 34578432,
+                        'netUnusedCapacityInKb': 102417408,
+                        'thinCapacityAllocatedInKb': 218103808}
+                     }
+                ))
+        }
+        with self.custom_response_mode(**data):
+            stats = self.driver.get_volume_stats(True)
+            self.assertEqual(130, stats['total_capacity_gb'])
+            self.assertEqual(97, stats['free_capacity_gb'])
+            self.assertEqual(137, stats['provisioned_capacity_gb'])

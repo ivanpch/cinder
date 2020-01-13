@@ -1,4 +1,4 @@
-# Copyright (c) 2013 - 2015 EMC Corporation.
+# Copyright (c) 2013 - 2020 Dell Inc. or its subsidiaries.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -77,51 +77,6 @@ class TestCreateVolume(scaleio.TestScaleIODriver):
             },
         }
 
-    def test_no_domain(self):
-        """No protection domain name or ID provided."""
-        self.driver.configuration.sio_protection_domain_name = None
-        self.driver.configuration.sio_protection_domain_id = None
-        self.driver.storage_pools = None
-        self.volume.host = "host@backend"
-        self.assertRaises(exception.VolumeBackendAPIException,
-                          self.test_create_volume)
-
-    def test_no_domain_id(self):
-        """Only protection domain name provided."""
-        self.driver.protection_domain_id = None
-        self.driver.protection_domain_name = self.PROT_DOMAIN_NAME
-        self.driver.storage_pool_name = None
-        self.driver.storage_pool_id = self.STORAGE_POOL_ID
-        self.test_create_volume()
-
-    def test_no_domain_id_invalid_response(self):
-        self.set_https_response_mode(self.RESPONSE_MODE.Invalid)
-        self.assertRaises(exception.VolumeBackendAPIException,
-                          self.test_no_domain_id)
-
-    def test_no_domain_id_badstatus_response(self):
-        self.set_https_response_mode(self.RESPONSE_MODE.BadStatus)
-        self.assertRaises(exception.VolumeBackendAPIException,
-                          self.test_no_domain_id)
-
-    def test_no_storage_id(self):
-        """Only protection domain name provided."""
-        self.driver.storage_pool_id = None
-        self.driver.storage_pool_name = self.STORAGE_POOL_NAME
-        self.driver.protection_domain_id = self.PROT_DOMAIN_ID
-        self.driver.protection_domain_name = None
-        self.test_create_volume()
-
-    def test_no_storage_id_invalid_response(self):
-        self.set_https_response_mode(self.RESPONSE_MODE.Invalid)
-        self.assertRaises(exception.VolumeBackendAPIException,
-                          self.test_no_storage_id)
-
-    def test_no_storage_id_badstatus_response(self):
-        self.set_https_response_mode(self.RESPONSE_MODE.BadStatus)
-        self.assertRaises(exception.VolumeBackendAPIException,
-                          self.test_no_storage_id)
-
     def test_create_volume(self):
         """Valid create volume parameters"""
         self.driver.create_volume(self.volume)
@@ -136,7 +91,7 @@ class TestCreateVolume(scaleio.TestScaleIODriver):
         self.assertRaises(exception.VolumeBackendAPIException,
                           self.test_create_volume)
 
-    @ddt.data({'provisioning:type': 'thin'}, {'provisioning:type': 'thin'})
+    @ddt.data({'provisioning:type': 'thin'}, {'provisioning:type': 'thick'})
     def test_create_thin_thick_volume(self, extraspecs):
         self.driver._get_volumetype_extraspecs = mock.MagicMock()
         self.driver._get_volumetype_extraspecs.return_value = extraspecs

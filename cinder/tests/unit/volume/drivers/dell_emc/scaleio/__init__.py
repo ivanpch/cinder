@@ -1,4 +1,4 @@
-# Copyright (c) 2013 - 2015 EMC Corporation.
+# Copyright (c) 2013 - 2020 Dell Inc. or its subsidiaries.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 import copy
+
 import requests
 import six
 
@@ -131,24 +132,18 @@ class TestScaleIODriver(test.TestCase):
         # Override the defaults to fake values
         self.override_config('san_ip', override='127.0.0.1',
                              group=conf.SHARED_CONF_GROUP)
-        self.override_config('sio_rest_server_port', override='8888',
+        self.override_config('vxflexos_rest_server_port', override='8888',
                              group=conf.SHARED_CONF_GROUP)
         self.override_config('san_login', override='test',
                              group=conf.SHARED_CONF_GROUP)
         self.override_config('san_password', override='pass',
                              group=conf.SHARED_CONF_GROUP)
-        self.override_config('sio_storage_pool_id',
-                             override=self.STORAGE_POOL_ID,
-                             group=conf.SHARED_CONF_GROUP)
-        self.override_config('sio_protection_domain_id',
-                             override=self.PROT_DOMAIN_ID,
-                             group=conf.SHARED_CONF_GROUP)
-        self.override_config('sio_storage_pools',
+        self.override_config('vxflexos_storage_pools',
                              override='PD1:SP1',
                              group=conf.SHARED_CONF_GROUP)
         self.override_config('max_over_subscription_ratio',
                              override=5.0, group=conf.SHARED_CONF_GROUP)
-        self.override_config('sio_server_api_version',
+        self.override_config('vxflexos_server_api_version',
                              override='2.0.0', group=conf.SHARED_CONF_GROUP)
 
     def do_request(self, url, *args, **kwargs):
