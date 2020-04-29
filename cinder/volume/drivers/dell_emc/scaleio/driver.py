@@ -596,6 +596,8 @@ class ScaleIODriver(driver.VolumeDriver):
             self._extend_volume(ret['provider_id'],
                                 snapshot.volume_size, volume.size)
 
+        return ret
+
     @staticmethod
     def _get_headers():
         return {'content-type': 'application/json'}
