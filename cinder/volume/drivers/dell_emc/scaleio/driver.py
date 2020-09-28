@@ -1,4 +1,4 @@
-# Copyright (c) 2017-2019 Dell Inc. or its subsidiaries.
+# Copyright (c) 2017-2020 Dell Inc. or its subsidiaries.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -27,6 +27,7 @@ from os_brick import initiator
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_log import versionutils
+from oslo_service import loopingcall
 from oslo_utils import units
 import requests
 import six
@@ -73,6 +74,8 @@ ILLEGAL_SYNTAX = 0
 VOLUME_ALREADY_MAPPED_ERROR = 81
 MIN_BWS_SCALING_SIZE = 128
 VXFLEXOS_MAX_OVERSUBSCRIPTION_RATIO = 10.0
+VOLUME_MIGRATION_IN_PROGRESS_ERROR = 717
+VOLUME_MIGRATION_ALREADY_ON_DESTINATION_POOL_ERROR = 718
 
 
 @interface.volumedriver
@@ -89,9 +92,10 @@ class ScaleIODriver(driver.VolumeDriver):
         2.0.3 - Added cache for storage pool and protection domains info
         2.0.4 - Added compatibility with os_brick>1.15.3
         2.0.41 - Added support for VxFlex OS 3.0.x and volume compression
+        2.0.42 - Add support for revert volume to snapshot and volume migration
     """
 
-    VERSION = "2.0.41"
+    VERSION = "2.0.42"
     # ThirdPartySystems wiki
     CI_WIKI_NAME = "DELL_EMC_ScaleIO_CI"
 
@@ -1771,6 +1775,295 @@ class ScaleIODriver(driver.VolumeDriver):
         request = ("https://%(server_ip)s:%(server_port)s"
                    "/api/instances/System/action/snapshotVolumes") % req_vars
         return self._execute_scaleio_post_request(params, request)
+
+    def revert_to_snapshot(self, context, volume, snapshot):
+        """Reverts  volume to the specified snapshot."""
+
+        LOG.info("Revert volume %(vol_id)s to snapshot %(snap_id)s.",
+                 {"vol_id": volume.id, "snap_id": snapshot.id})
+
+        if not self._version_greater_than_or_equal(
+                self._get_server_api_version(),
+                "3.0"
+        ):
+            LOG.debug("VxFlex OS (ScaleIO) versions less than v3.0 do not "
+                      "support reverting volume to snapshot. "
+                      "Falling back to generic revert to snapshot method.")
+            raise NotImplementedError
+        elif snapshot.volume_size != volume.size:
+            msg = (_("Volume %(vol_id)s size is not equal to snapshot "
+                     "%(snap_id)s size. Revert to snapshot operation is not "
+                     "allowed.") %
+                   {"vol_id": volume.id, "snap_id": snapshot.id})
+            LOG.error(msg)
+            raise exception.InvalidVolume(reason=msg)
+
+        self._revert_to_snapshot(volume, snapshot)
+
+    def _revert_to_snapshot(self, volume, snapshot):
+        params = {"srcVolumeId": snapshot.provider_id}
+        req_vars = {'server_ip': self.server_ip,
+                    'server_port': self.server_port,
+                    'vol_id': volume.provider_id}
+        request = ("https://%(server_ip)s:%(server_port)s"
+                   "/api/instances/Volume::%(vol_id)s/action"
+                   "/overwriteVolumeContent") % req_vars
+        LOG.info("Revert volume to snapshot request: %s.", request)
+        r, response = self._execute_scaleio_post_request(params, request)
+        if r.status_code != http_client.OK and "errorCode" in response:
+            msg = (_("Failed to revert volume %(vol_id)s to snapshot "
+                     "%(snap_id)s: %(err)s.") % {"vol_id": volume.id,
+                                                 "snap_id": snapshot.id,
+                                                 "err": response["message"]})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(msg)
+
+    def migrate_volume(self, ctxt, volume, host):
+        """Migrate VxFlex OS volume within the same backend."""
+
+        LOG.info("Migrate volume %(vol_id)s to %(host)s.",
+                 {"vol_id": volume.id, "host": host["host"]})
+
+        def fall_back_to_host_assisted():
+            LOG.debug("Falling back to host-assisted migration.")
+            return False, None
+
+        # Check migration between different backends
+        src_backend = volume_utils.extract_host(volume.host, "backend")
+        dst_backend = volume_utils.extract_host(host["host"], "backend")
+        if src_backend != dst_backend:
+            LOG.debug("Cross-backends migration is not supported "
+                      "by VxFlex OS.")
+            return fall_back_to_host_assisted()
+
+        # Check migration is supported by storage API
+        if not self._version_greater_than_or_equal(
+                self._get_server_api_version(),
+                "3.0"
+        ):
+            LOG.debug("VxFlex OS versions less than v3.0 do not "
+                      "support volume migration.")
+            return fall_back_to_host_assisted()
+
+        # Check storage pools compatibility
+        src_pd, src_sp = (
+            volume_utils.extract_host(volume.host, 'pool').split(':'))
+        dst_pd, dst_sp = (
+            volume_utils.extract_host(host['host'], 'pool').split(':'))
+        if not self._pools_compatible_for_migration(src_pd,
+                                                    src_sp,
+                                                    dst_pd,
+                                                    dst_sp):
+            return fall_back_to_host_assisted()
+
+        real_provisioning, vtree_id = (
+            self._get_real_provisioning_and_vtree(volume.provider_id)
+        )
+        params = self._get_volume_migration_params(volume,
+                                                   dst_pd,
+                                                   dst_sp,
+                                                   real_provisioning)
+        self._migrate_vtree(volume, params)
+        try:
+            self._wait_for_volume_migration_to_complete(vtree_id, volume.id)
+        except loopingcall.LoopingCallTimeOut:
+            # Volume migration is still in progress but timeout has expired.
+            # Volume status is set to maintenance to prevent performing other
+            # operations with volume. Migration status should be checked on the
+            # storage side. If the migration successfully completed, volume
+            # status should be manually changed to AVAILABLE.
+            updates = {
+                "status": "maintenance",
+            }
+            msg = (_("Migration of volume %s is still in progress "
+                     "but timeout has expired. Volume status is set to "
+                     "maintenance to prevent performing operations with this "
+                     "volume. Check the migration status "
+                     "on the storage side and set volume status manually if "
+                     "migration succeeded.") % volume.id)
+            LOG.warning(msg)
+            return True, updates
+        return True, {}
+
+    def _pools_compatible_for_migration(self, src_pd, src_sp, dst_pd, dst_sp):
+        """Compare storage pools properties to determine migration possibility.
+
+        Limitations:
+         - For migration from Medium Granularity (MG) to Fine Granularity (FG)
+           storage pool zero padding must be enabled on the MG pool.
+         - For migration from MG to MG pool zero padding must be either enabled
+           or disabled on both pools.
+        """
+
+        src_zero_padding_enabled = self._is_volume_creation_safe(src_pd,
+                                                                 src_sp)
+        dst_zero_padding_enabled = self._is_volume_creation_safe(dst_pd,
+                                                                 dst_sp)
+        src_is_fg_pool = self._is_fine_granularity_pool(src_pd, src_sp)
+        dst_is_fg_pool = self._is_fine_granularity_pool(dst_pd, dst_sp)
+        if src_is_fg_pool:
+            return True
+        elif dst_is_fg_pool:
+            if not src_zero_padding_enabled:
+                LOG.debug("Migration from Medium Granularity storage pool "
+                          "with zero padding disabled to Fine Granularity one "
+                          "is not allowed.")
+                return False
+            return True
+        elif not src_zero_padding_enabled == dst_zero_padding_enabled:
+            LOG.debug("Zero padding must be either enabled or disabled on "
+                      "both storage pools.")
+            return False
+        return True
+
+    def _get_real_provisioning_and_vtree(self, provider_id):
+        """Get volume real provisioning type and vtree_id."""
+
+        req_vars = {'server_ip': self.server_ip,
+                    'server_port': self.server_port,
+                    'vol_id': provider_id}
+        request = ("https://%(server_ip)s:%(server_port)s"
+                   "/api/instances/Volume::%(vol_id)s") % req_vars
+        LOG.info("Query Volume request: %s.", request)
+        r, response = self._execute_scaleio_get_request(request)
+        if r.status_code != http_client.OK and "errorCode" in response:
+            msg = (_("Failed to query volume: %s.") % response["message"])
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+        try:
+            provisioning = response["volumeType"]
+            vtree_id = response["vtreeId"]
+            return provisioning, vtree_id
+        except KeyError:
+            msg = (_("Query volume response does not contain "
+                     "required fields: volumeType and vtreeId."))
+            LOG.error(msg)
+            raise exception.MalformedResponse(
+                cmd="_get_real_provisioning_and_vtree",
+                reason=msg
+            )
+
+    def _get_volume_migration_params(self,
+                                     volume,
+                                     dst_domain_name,
+                                     dst_pool_name,
+                                     real_provisioning):
+        dst_pool_id = self._get_storage_pool_id(dst_domain_name,
+                                                dst_pool_name)
+        params = {
+            "destSPId": dst_pool_id,
+            "volTypeConversion": "NoConversion",
+            "compressionMethod": "None",
+            "allowDuringRebuild": six.text_type(
+                self.configuration.vxflexos_allow_migration_during_rebuild
+            ),
+        }
+        storage_type = self._get_volumetype_extraspecs(volume)
+        provisioning_type = self._find_provisioning_type(storage_type)
+        compression = "None"
+        if self._check_pool_support_compression(dst_domain_name,
+                                                dst_pool_name):
+            if provisioning_type == "compressed":
+                compression = "Normal"
+        pool_supports_thick_vols = self._check_pool_support_thick_vols(
+            dst_domain_name,
+            dst_pool_name
+        )
+        if (
+                real_provisioning == "ThickProvisioned" and
+                (provisioning_type in ["thin", "compressed"] or
+                 not pool_supports_thick_vols)
+        ):
+            params["volTypeConversion"] = "ThickToThin"
+        elif (
+                real_provisioning == "ThinProvisioned" and
+                provisioning_type == "thick" and
+                pool_supports_thick_vols
+        ):
+            params["volTypeConversion"] = "ThinToThick"
+        params["compressionMethod"] = compression
+        return params
+
+    @utils.retry(exception.VolumeBackendAPIException,
+                 interval=5, backoff_rate=1, retries=3)
+    def _wait_for_volume_migration_to_complete(self, vtree_id, vol_id):
+        """Check volume migration status."""
+
+        LOG.debug("Wait for migration of volume %s to complete.", vol_id)
+
+        def _inner():
+            response = self._query_vtree(vtree_id, vol_id)
+            try:
+                migration_status = (
+                    response["vtreeMigrationInfo"]["migrationStatus"]
+                )
+                migration_pause_reason = (
+                    response["vtreeMigrationInfo"]["migrationPauseReason"]
+                )
+                if (
+                        migration_status == "NotInMigration" and
+                        not migration_pause_reason
+                ):
+                    # Migration completed successfully.
+                    raise loopingcall.LoopingCallDone()
+                elif migration_pause_reason:
+                    # Migration failed or paused on the storage side.
+                    # Volume remains on the source backend.
+                    msg = (_("Migration of volume %(vol_id)s failed or "
+                             "paused on the storage side. "
+                             "Migration status: %(status)s, "
+                             "pause reason: %(reason)s.") %
+                           {"vol_id": vol_id,
+                            "status": migration_status,
+                            "reason": migration_pause_reason})
+                    LOG.error(msg)
+                    raise exception.VolumeMigrationFailed(msg)
+            except KeyError:
+                msg = (_("Check Migration status response does not contain "
+                         "required fields: migrationStatus and "
+                         "migrationPauseReason."))
+                LOG.error(msg)
+                raise exception.MalformedResponse(
+                    cmd="_wait_for_volume_migration_to_complete",
+                    reason=msg
+                )
+        timer = loopingcall.FixedIntervalWithTimeoutLoopingCall(_inner)
+        timer.start(interval=30, timeout=3600).wait()
+
+    def _query_vtree(self, vtree_id, vol_id):
+        req_vars = {'server_ip': self.server_ip,
+                    'server_port': self.server_port,
+                    'vtree_id': vtree_id}
+        request = ("https://%(server_ip)s:%(server_port)s"
+                   "/api/instances/VTree::%(vtree_id)s") % req_vars
+        LOG.info("Query VTree request: %s.", request)
+        r, response = self._execute_scaleio_get_request(request)
+        if r.status_code != http_client.OK:
+            msg = (_("Failed to check migration status of volume %s.")
+                   % vol_id)
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(msg)
+        return response
+
+    def _migrate_vtree(self, volume, params):
+        req_vars = {'server_ip': self.server_ip,
+                    'server_port': self.server_port,
+                    'vol_id': volume.provider_id}
+        request = ("https://%(server_ip)s:%(server_port)s"
+                   "/api/instances/Volume::%(vol_id)s/action"
+                   "/migrateVTree") % req_vars
+        LOG.info("Migrate VTree request: %s.", request)
+        r, response = self._execute_scaleio_post_request(params, request)
+        if r.status_code != http_client.OK:
+            error_code = response["errorCode"]
+            if error_code not in [
+                VOLUME_MIGRATION_IN_PROGRESS_ERROR,
+                VOLUME_MIGRATION_ALREADY_ON_DESTINATION_POOL_ERROR,
+            ]:
+                msg = (_("Failed to migrate volume %s.") % volume.id)
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(msg)
+        return response
 
     def ensure_export(self, context, volume):
         """Driver entry point to get the export info for an existing volume."""
